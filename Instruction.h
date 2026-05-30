@@ -2,6 +2,9 @@
 #define INSTRUCTION_H
 #include <string>
 
+// Instruction: representa uma instrução do programa de entrada.
+// Armazena os operandos/offsets e os ciclos onde cada estágio foi registrado
+// (issue, exec start, exec end, write result, commit) para fins de rastreamento.
 class Instruction {
     public:
         std::string op;

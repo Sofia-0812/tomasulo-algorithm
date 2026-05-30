@@ -6,15 +6,33 @@ Simulador do algoritmo de Tomasulo com superescalaridade (2 vias) feito em C++ p
 
 ```
 g++ -std=c++17 -o tomasulo main.cpp
+# ou com clang++
+clang++ -std=c++11 -g main.cpp -o tomasulo
 ```
 
 ## Como rodar
 
-```
-./tomasulo instructions.txt
+```bash
+./tomasulo instructions.txt [memory.txt]
 ```
 
+- `instructions.txt` é o arquivo de instruções (padrão se omitido).
+- `memory.txt` é opcional; se fornecido, inicializa valores de memória antes da simulação.
+
 O resultado é salvo no arquivo `result.txt`.
+
+### Formato do `memory.txt`
+
+Cada linha deve ter: `<endereco> <valor>` (separados por espaço). Exemplo:
+
+```
+# comentario ignorado
+132 132.0
+244 244.0
+116 0.0
+```
+
+Linhas começando com `#` são ignoradas.
 
 ## Formato do arquivo de entrada
 
@@ -98,6 +116,11 @@ A saida mostra para cada ciclo:
 - MUL: 10 ciclos
 - DIV: 40 ciclos
 - LW/SW: 2 ciclos
+
+Observação sobre LW/SW
+----------------------
+- `LW`: o load reserva um ROB e, quando o resultado é escrito, o ROB contém o endereço efetivo; o valor final é lido da memória no *commit* (in-order). O simulador também encaminha (forward) valores quando possível.
+- `SW`: o store coloca endereço e valor no ROB; a escrita na memória é aplicada somente na etapa de *commit*.
 
 ## Reservation Stations
 

@@ -5,58 +5,19 @@
 #include <vector>
 #include <unordered_map>
 #include <iomanip> 
+// Modular headers: types are declared in separate headers to keep main.cpp focused
+#include "ReservationStation.h"
+#include "Instruction.h"
+#include "ROBEntry.h"
 
-// Removidos os includes fictícios para manter o código auto-contido caso necessário,
-// mas pode mantê-los se os seus arquivos .h estiverem na mesma pasta.
-#ifndef RESERVATION_STATION_H
-struct ReservationStation {
-    std::string name;
-    std::string type;
-    bool busy = false;
-    std::string op = "-";
-    float vj = 0.0f;
-    float vk = 0.0f;
-    std::string qj = ""; 
-    std::string qk = ""; 
-    int A = 0;
-    bool executing = false;
-    int execCyclesRemaining = 0;
-    int instrIndex = -1;
-    int robId = -1;       
-
-    ReservationStation(std::string n, std::string t) : name(n), type(t) {}
-    void clear() {
-        busy = false; op = "-"; vj = 0.0f; vk = 0.0f;
-        qj = ""; qk = ""; A = 0; executing = false;
-        execCyclesRemaining = 0; instrIndex = -1; robId = -1;
-    }
-};
-#endif
-
-#ifndef INSTRUCTION_H
-struct Instruction {
-    std::string op, r1, r2, r3;
-    int imm;
-    int issueCycle = -1, execStartCycle = -1, execEndCycle = -1, writeResultCycle = -1, commitCycle = -1;
-    Instruction(std::string o, std::string reg1, std::string reg2, std::string reg3, int im)
-        : op(o), r1(reg1), r2(reg2), r3(reg3), imm(im) {}
-};
-#endif
-
-#ifndef ROB_ENTRY_H
-struct ROBEntry {
-    int id;
-    bool busy = false;
-    std::string op;
-    std::string dest;
-    float value = 0.0f;
-    bool ready = false;
-    int instrIndex = -1;
-};
-#endif
+// main.cpp: implementação do simulador Tomasulo e do loop de clock.
+// As estruturas básicas (`Instruction`, `ReservationStation`, `ROBEntry`) estão
+// definidas em seus respectivos headers para facilitar leitura e documentação.
 
 std::ofstream outFile;
 
+// getLatency: retorna a latência (em ciclos) associada a cada operação.
+// Use este lugar para ajustar latências do pipeline (ADD/SUB, MUL, DIV, LW/SW etc).
 int getLatency(std::string op) {
     if (op == "ADD" || op == "SUB") return 2;
     if (op == "MUL") return 5;
@@ -65,6 +26,8 @@ int getLatency(std::string op) {
     return 1;
 }
 
+// getRsType: mapeia uma operação ao tipo de Reservation Station necessária.
+// Retorna "ADD/SUB", "MUL/DIV", "LOAD" ou "STORE".
 std::string getRsType(std::string op) {
     if (op == "ADD" || op == "SUB") return "ADD/SUB";
     if (op == "MUL" || op == "DIV") return "MUL/DIV";
@@ -73,6 +36,8 @@ std::string getRsType(std::string op) {
     return "";
 }
 
+// hasWork: determina se ainda há trabalho a ser feito (instruções a emitir,
+// reservation stations ocupadas ou entradas ativas no ROB).
 bool hasWork(std::vector<Instruction>& instructions, int nextIssue, 
              std::vector<ReservationStation>& rs, std::vector<ROBEntry>& rob) {
     if (nextIssue < (int)instructions.size()) return true;
@@ -81,6 +46,8 @@ bool hasWork(std::vector<Instruction>& instructions, int nextIssue,
     return false;
 }
 
+// formatFloat: formata floats com até 2 casas significativas, removendo
+// zeros não significativos. Usado apenas para melhorar a legibilidade do log.
 std::string formatFloat(float value) {
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(2) << value;
@@ -92,6 +59,10 @@ std::string formatFloat(float value) {
     return str;
 }
 
+// printState: escreve o estado completo do simulador em `result.txt`.
+// Inclui ROB, Reservation Stations, Register File/Status e a tabela de instruções
+// com os ciclos de issue/exec/write/commit. Essa função é puramente de
+// apresentação/log e não altera o estado da simulação.
 void printState(int cycle, std::vector<ReservationStation>& rs,
                 std::unordered_map<std::string, std::string>& regStatus,
                 std::unordered_map<std::string, float>& registers,
@@ -128,7 +99,12 @@ void printState(int cycle, std::vector<ReservationStation>& rs,
             }
         }
         
-        std::string destVal = entry.dest + " = " + (entry.ready ? formatFloat(entry.value) : "-");
+        std::string destVal;
+        if (entry.op == "SW") {
+            destVal = (entry.ready ? ("[" + std::to_string(entry.addr) + "]=" + formatFloat(entry.value)) : "-");
+        } else {
+            destVal = entry.dest + " = " + (entry.ready ? formatFloat(entry.value) : "-");
+        }
         outFile << std::left << std::setw(8)  << ("#" + std::to_string(entry.id))
                              << std::setw(6)  << "Sim"
                              << std::setw(30) << instStr
@@ -218,16 +194,36 @@ void printState(int cycle, std::vector<ReservationStation>& rs,
 }
 
 // ETAPA 4: COMMIT
+// commitInstruction: aplica o commit da entrada mais velha do ROB se ela estiver
+// pronta. Para stores (`SW`) grava na memória; para loads/escritas de registrador
+// atualiza o Register File quando o ROB que produz o valor for o esperado.
 void commitInstruction(int cycle, std::vector<ROBEntry>& rob, 
                        std::unordered_map<std::string, std::string>& regStatus,
                        std::unordered_map<std::string, float>& registers,
-                       std::vector<Instruction>& instructions) {
+                       std::vector<Instruction>& instructions,
+                       std::unordered_map<int, float>& memory) {
     if (!rob.empty() && rob[0].busy && rob[0].ready) {
         ROBEntry committed = rob[0];
         
-        if (committed.op != "SW") {
+        if (committed.op == "SW") {
+            // For stores, commit to memory (in-order)
+            memory[committed.addr] = committed.value;
+        } else if (committed.op == "LW") {
+            // For loads, read memory at the effective address (if present)
+            if (memory.find(committed.addr) != memory.end()) {
+                committed.value = memory[committed.addr];
+            } else {
+                // fallback: if memory not initialized, keep address as value
+                committed.value = (float)committed.addr;
+            }
             std::string robTag = "#" + std::to_string(committed.id);
-            if (regStatus[committed.dest] == robTag) {
+            if (!committed.dest.empty() && regStatus[committed.dest] == robTag) {
+                registers[committed.dest] = committed.value;
+                regStatus[committed.dest] = "";
+            }
+        } else {
+            std::string robTag = "#" + std::to_string(committed.id);
+            if (!committed.dest.empty() && regStatus[committed.dest] == robTag) {
                 registers[committed.dest] = committed.value;
                 regStatus[committed.dest] = "";
             }
@@ -246,8 +242,13 @@ void commitInstruction(int cycle, std::vector<ROBEntry>& rob,
 }
 
 // ETAPA 3: WRITE RESULT
+// writeResult: verifica se alguma Reservation Station terminou a execução
+// (execCyclesRemaining == 0) e então coloca o resultado no ROB correspondente
+// e no CDB (simulado atualizando Qj/Qk de outras RS). Apenas 1 resultado é
+// escrito por ciclo (a função retorna após processar o primeiro result-ready).
 void writeResult(int cycle, std::vector<ReservationStation>& rs,
-                 std::vector<Instruction>& instructions, std::vector<ROBEntry>& rob) {
+                 std::vector<Instruction>& instructions, std::vector<ROBEntry>& rob,
+                 std::unordered_map<int, float>& memory) {
     for (int i = 0; i < (int)rs.size(); i++) {
         if (!rs[i].busy || !rs[i].executing || rs[i].execCyclesRemaining > 0) continue;
 
@@ -256,8 +257,16 @@ void writeResult(int cycle, std::vector<ReservationStation>& rs,
         else if (rs[i].op == "SUB") result = rs[i].vj - rs[i].vk;
         else if (rs[i].op == "MUL") result = rs[i].vj * rs[i].vk;
         else if (rs[i].op == "DIV") { if (rs[i].vk != 0) result = rs[i].vj / rs[i].vk; }
-        // Ajuste conceitual: LW calcula o endereço efetivo (Imediato + RegBase)
-        else if (rs[i].op == "LW")  result = (float)(rs[i].A + rs[i].vj); 
+        // LW: ler da memoria (endereco efetivo = A + base)
+        else if (rs[i].op == "LW")  {
+            int addr = rs[i].A + (int)rs[i].vj;
+            // será substituído por memoria real no commit via ROB
+            result = (float)addr; // valor temporário caso memoria nao exista
+        }
+        // SW: o resultado que será escrito é o valor a ser armazenado; o endereco eh A + base (vk)
+        else if (rs[i].op == "SW") {
+            // nothing to compute here; handled below when updating ROB
+        }
 
         std::string myRobTag = "#" + std::to_string(rs[i].robId);
 
@@ -269,8 +278,22 @@ void writeResult(int cycle, std::vector<ReservationStation>& rs,
 
         for (auto& entry : rob) {
             if (entry.busy && entry.id == rs[i].robId) {
-                entry.value = result;
-                entry.ready = true;
+                if (rs[i].op == "SW") {
+                    // For store, compute effective address from base (vk) and offset A
+                    int addr = rs[i].A + (int)rs[i].vk;
+                    entry.addr = addr;
+                    entry.value = rs[i].vj; // value to store
+                    entry.ready = true;
+                } else if (rs[i].op == "LW") {
+                    int addr = rs[i].A + (int)rs[i].vj;
+                    entry.addr = addr;
+                    if (memory.find(addr) != memory.end()) entry.value = memory[addr];
+                    else entry.value = (float)addr;
+                    entry.ready = true;
+                } else {
+                    entry.value = result;
+                    entry.ready = true;
+                }
                 break;
             }
         }
@@ -285,6 +308,9 @@ void writeResult(int cycle, std::vector<ReservationStation>& rs,
 }
 
 // ETAPA 2: EXECUTE INSTRUCTION
+// executeInstruction: inicia a execução de uma RS quando ambos operandos
+// estiverem prontos e a instrução não foi emitida no ciclo atual; decrementa
+// o contador de ciclos de execução para instruções já em execução.
 void executeInstruction(int cycle, std::vector<ReservationStation>& rs,
                         std::vector<Instruction>& instructions) {
     for (int i = 0; i < (int)rs.size(); i++) {
@@ -309,6 +335,9 @@ void executeInstruction(int cycle, std::vector<ReservationStation>& rs,
 }
 
 // ETAPA 1: ISSUE INSTRUCTION
+// issueInstruction: despacha até duas instruções por ciclo para RSs livres
+// e reserva uma entrada no ROB. Também resolve fontes de operandos via
+// Register Status e ROB forwarding quando possível.
 void issueInstruction(int cycle, std::vector<Instruction>& instructions, int& nextIssue,
                       std::vector<ReservationStation>& rs,
                       std::unordered_map<std::string, std::string>& regStatus,
@@ -333,7 +362,7 @@ void issueInstruction(int cycle, std::vector<Instruction>& instructions, int& ne
 
         freeROB->busy = true;
         freeROB->op = instr.op;
-        freeROB->dest = instr.r1;
+        freeROB->dest = (instr.op == "SW") ? "" : instr.r1;
         freeROB->ready = false;
         freeROB->instrIndex = nextIssue;
         std::string robTag = "#" + std::to_string(freeROB->id);
@@ -410,9 +439,27 @@ std::vector<Instruction> parseFile(std::string filename) {
     return instructions;
 }
 
+std::unordered_map<int, float> parseMemoryFile(const std::string& filename) {
+    std::unordered_map<int, float> mem;
+    std::ifstream file(filename);
+    if (!file) return mem;
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty()) continue;
+        if (line[0] == '#') continue;
+        std::istringstream iss(line);
+        int addr; float val;
+        if (!(iss >> addr >> val)) continue;
+        mem[addr] = val;
+    }
+    return mem;
+}
+
 int main(int argc, char* argv[]) {
     std::string filename = "instructions.txt";
+    std::string memoryFilename = "memory.txt";
     if (argc > 1) filename = argv[1];
+    if (argc > 2) memoryFilename = argv[2];
 
     std::vector<Instruction> instructions = parseFile(filename);
     if (instructions.empty()) {
@@ -443,12 +490,23 @@ int main(int argc, char* argv[]) {
 
     std::unordered_map<std::string, std::string> regStatus;
 
+    // Simple memory model: map effective integer addresses to float values.
+    std::unordered_map<int, float> memory;
+    // default initial memory values (kept for backward compatibility)
+    memory[132] = 132.0f;
+    memory[244] = 244.0f;
+    memory[116] = 0.0f;
+
+    // If a memory file exists, parse and override/add entries.
+    auto fileMem = parseMemoryFile(memoryFilename);
+    for (const auto& p : fileMem) memory[p.first] = p.second;
+
     int cycle = 1;
     int nextIssue = 0;
 
     while (hasWork(instructions, nextIssue, rs, rob)) {
-        commitInstruction(cycle, rob, regStatus, registers, instructions);
-        writeResult(cycle, rs, instructions, rob);
+        commitInstruction(cycle, rob, regStatus, registers, instructions, memory);
+        writeResult(cycle, rs, instructions, rob, memory);
         executeInstruction(cycle, rs, instructions);
         issueInstruction(cycle, instructions, nextIssue, rs, regStatus, registers, rob);
         printState(cycle, rs, regStatus, registers, instructions, rob);
