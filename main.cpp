@@ -9,12 +9,25 @@
 #include "ReservationStation.h"
 #include "Instruction.h"
 #include "ROBEntry.h"
+#include "ReorderBuffer.h"
+#include "StoreBuffer.h"
 
 // main.cpp: implementação do simulador Tomasulo e do loop de clock.
 // As estruturas básicas (`Instruction`, `ReservationStation`, `ROBEntry`) estão
 // definidas em seus respectivos headers para facilitar leitura e documentação.
 
 std::ofstream outFile;
+
+// robStateToString: converte o estado interno do ROB em texto para o log.
+std::string robStateToString(ROBState state) {
+    switch (state) {
+        case ROBState::Issued: return "Issue";
+        case ROBState::Executing: return "Execute";
+        case ROBState::WriteResult: return "Write result";
+        case ROBState::Commit: return "Commit";
+        case ROBState::Free: default: return "-";
+    }
+}
 
 // getLatency: retorna a latência (em ciclos) associada a cada operação.
 // Use este lugar para ajustar latências do pipeline (ADD/SUB, MUL, DIV, LW/SW etc).
@@ -39,10 +52,12 @@ std::string getRsType(std::string op) {
 // hasWork: determina se ainda há trabalho a ser feito (instruções a emitir,
 // reservation stations ocupadas ou entradas ativas no ROB).
 bool hasWork(std::vector<Instruction>& instructions, int nextIssue, 
-             std::vector<ReservationStation>& rs, std::vector<ROBEntry>& rob) {
+             std::vector<ReservationStation>& rs, const CircularROB& rob,
+             std::vector<StoreBufferEntry>& sb) {
     if (nextIssue < (int)instructions.size()) return true;
     for (const auto& station : rs) if (station.busy) return true;
-    for (const auto& entry : rob) if (entry.busy) return true;
+    if (rob.size() > 0) return true;
+    for (const auto& s : sb) if (s.busy) return true;
     return false;
 }
 
@@ -67,7 +82,8 @@ void printState(int cycle, std::vector<ReservationStation>& rs,
                 std::unordered_map<std::string, std::string>& regStatus,
                 std::unordered_map<std::string, float>& registers,
                 std::vector<Instruction>& instructions,
-                std::vector<ROBEntry>& rob) {
+                const CircularROB& rob,
+                std::vector<StoreBufferEntry>& sb) {
     
     outFile << "=========================================================================================\n";
     outFile << "                                       CICLO " << cycle << "\n";
@@ -82,15 +98,15 @@ void printState(int cycle, std::vector<ReservationStation>& rs,
                          << std::setw(15) << "Estado" 
                          << std::setw(15) << "Destino/Valor" << "\n";
     outFile << "-----------------------------------------------------------------------------------------\n";
-    for (const auto& entry : rob) {
-        if (!entry.busy) continue;
+    for (int i = 0; i < rob.capacity(); i++) {
+        const auto& entry = rob.slotAt(i);
         
         // Garante que o estado exibido case perfeitamente com o ciclo de gravação
-        std::string stateStr = "Execute";
-        if (entry.ready) stateStr = "Write Result";
+        std::string stateStr = robStateToString(entry.state);
+        if (stateStr == "-" && entry.busy) stateStr = entry.ready ? "Write result" : "Issue";
         
         std::string instStr = "-";
-        if (entry.instrIndex >= 0) {
+        if (entry.busy && entry.instrIndex >= 0) {
             const auto& inst = instructions[entry.instrIndex];
             if (inst.op == "LW" || inst.op == "SW") {
                 instStr = inst.op + " " + inst.r1 + ", " + std::to_string(inst.imm) + "(" + inst.r2 + ")";
@@ -100,18 +116,31 @@ void printState(int cycle, std::vector<ReservationStation>& rs,
         }
         
         std::string destVal;
-        if (entry.op == "SW") {
+        if (entry.busy && entry.op == "SW") {
             destVal = (entry.ready ? ("[" + std::to_string(entry.addr) + "]=" + formatFloat(entry.value)) : "-");
-        } else {
+        } else if (entry.busy) {
             destVal = entry.dest + " = " + (entry.ready ? formatFloat(entry.value) : "-");
+        } else {
+            destVal = "-";
         }
-        outFile << std::left << std::setw(8)  << ("#" + std::to_string(entry.id))
-                             << std::setw(6)  << "Sim"
+        outFile << std::left << std::setw(8)  << (entry.id > 0 ? ("#" + std::to_string(entry.id)) : "-")
+                             << std::setw(6)  << (entry.busy ? "Sim" : "Nao")
                              << std::setw(30) << instStr
                              << std::setw(15) << stateStr
                              << std::setw(15) << destVal << "\n";
     }
     outFile << "-----------------------------------------------------------------------------------------\n";
+
+    // --- 1.5. TABELA: STORE BUFFER (opcional) ---
+    outFile << "\n[ STORE BUFFER ]\n";
+    outFile << "-----------------------------------------------------\n";
+    outFile << std::left << std::setw(8) << "Slot" << std::setw(8) << "Busy" << std::setw(10) << "ROB#" << std::setw(10) << "Addr" << std::setw(10) << "Value" << "\n";
+    outFile << "-----------------------------------------------------\n";
+    for (int i = 0; i < (int)sb.size(); i++) {
+        const auto& s = sb[i];
+        outFile << std::left << std::setw(8) << ("S" + std::to_string(i)) << std::setw(8) << (s.busy?"Sim":"Nao") << std::setw(10) << (s.robId>0?("#"+std::to_string(s.robId)):"-") << std::setw(10) << (s.ready?std::to_string(s.addr):"-") << std::setw(10) << (s.ready?formatFloat(s.value):"-") << "\n";
+    }
+    outFile << "-----------------------------------------------------\n";
 
     // --- 2. TABELA: RESERVATION STATIONS ---
     outFile << "\n[ RESERVATION STATIONS ]\n";
@@ -195,50 +224,46 @@ void printState(int cycle, std::vector<ReservationStation>& rs,
 
 // ETAPA 4: COMMIT
 // commitInstruction: aplica o commit da entrada mais velha do ROB se ela estiver
-// pronta. Para stores (`SW`) grava na memória; para loads/escritas de registrador
-// atualiza o Register File quando o ROB que produz o valor for o esperado.
-void commitInstruction(int cycle, std::vector<ROBEntry>& rob, 
+// pronta. O ROB é circular e de tamanho fixo: o slot do head é commitado e o
+// ponteiro avança, preservando a ordem in-order exigida pelo algoritmo.
+void commitInstruction(int cycle, CircularROB& rob, 
                        std::unordered_map<std::string, std::string>& regStatus,
                        std::unordered_map<std::string, float>& registers,
                        std::vector<Instruction>& instructions,
-                       std::unordered_map<int, float>& memory) {
-    if (!rob.empty() && rob[0].busy && rob[0].ready) {
-        ROBEntry committed = rob[0];
-        
-        if (committed.op == "SW") {
-            // For stores, commit to memory (in-order)
+                       std::unordered_map<int, float>& memory,
+                       std::vector<StoreBufferEntry>& sb) {
+    ROBEntry* front = rob.front();
+    if (front == nullptr || !front->busy || !front->ready) return;
+
+    ROBEntry committed = *front;
+    front->state = ROBState::Commit;
+
+    if (committed.op == "SW") {
+        bool wrote = false;
+        for (auto& s : sb) {
+            if (s.busy && s.robId == committed.id && s.ready) {
+                memory[s.addr] = s.value;
+                s.busy = false;
+                wrote = true;
+                break;
+            }
+        }
+        if (!wrote) {
             memory[committed.addr] = committed.value;
-        } else if (committed.op == "LW") {
-            // For loads, read memory at the effective address (if present)
-            if (memory.find(committed.addr) != memory.end()) {
-                committed.value = memory[committed.addr];
-            } else {
-                // fallback: if memory not initialized, keep address as value
-                committed.value = (float)committed.addr;
-            }
-            std::string robTag = "#" + std::to_string(committed.id);
-            if (!committed.dest.empty() && regStatus[committed.dest] == robTag) {
-                registers[committed.dest] = committed.value;
-                regStatus[committed.dest] = "";
-            }
-        } else {
-            std::string robTag = "#" + std::to_string(committed.id);
-            if (!committed.dest.empty() && regStatus[committed.dest] == robTag) {
-                registers[committed.dest] = committed.value;
-                regStatus[committed.dest] = "";
-            }
         }
-
-        if (committed.instrIndex >= 0) {
-            instructions[committed.instrIndex].commitCycle = cycle;
+    } else {
+        std::string robTag = "#" + std::to_string(committed.id);
+        if (!committed.dest.empty() && regStatus[committed.dest] == robTag) {
+            registers[committed.dest] = committed.value;
+            regStatus[committed.dest] = "";
         }
-
-        rob.erase(rob.begin());
-        
-        ROBEntry newEntry;
-        newEntry.id = rob.empty() ? 1 : rob.back().id + 1;
-        rob.push_back(newEntry);
     }
+
+    if (committed.instrIndex >= 0) {
+        instructions[committed.instrIndex].commitCycle = cycle;
+    }
+
+    rob.commitFront();
 }
 
 // ETAPA 3: WRITE RESULT
@@ -247,8 +272,9 @@ void commitInstruction(int cycle, std::vector<ROBEntry>& rob,
 // e no CDB (simulado atualizando Qj/Qk de outras RS). Apenas 1 resultado é
 // escrito por ciclo (a função retorna após processar o primeiro result-ready).
 void writeResult(int cycle, std::vector<ReservationStation>& rs,
-                 std::vector<Instruction>& instructions, std::vector<ROBEntry>& rob,
-                 std::unordered_map<int, float>& memory) {
+                 std::vector<Instruction>& instructions, CircularROB& rob,
+                 std::unordered_map<int, float>& memory,
+                 std::vector<StoreBufferEntry>& sb) {
     for (int i = 0; i < (int)rs.size(); i++) {
         if (!rs[i].busy || !rs[i].executing || rs[i].execCyclesRemaining > 0) continue;
 
@@ -258,10 +284,35 @@ void writeResult(int cycle, std::vector<ReservationStation>& rs,
         else if (rs[i].op == "MUL") result = rs[i].vj * rs[i].vk;
         else if (rs[i].op == "DIV") { if (rs[i].vk != 0) result = rs[i].vj / rs[i].vk; }
         // LW: ler da memoria (endereco efetivo = A + base)
-        else if (rs[i].op == "LW")  {
+                else if (rs[i].op == "LW")  {
             int addr = rs[i].A + (int)rs[i].vj;
-            // será substituído por memoria real no commit via ROB
-            result = (float)addr; // valor temporário caso memoria nao exista
+            // Memory disambiguation / forwarding:
+            // If there is any older store to the same address in the ROB,
+            // we must use that store's value (if ready) or stall the load
+            // until the store computes its address/value.
+            bool stallForStore = false;
+            bool forwarded = false;
+            // find load's index in the ROB vector
+            rob.forEachActive([&](const ROBEntry& entry) {
+                if (entry.id >= rs[i].robId || forwarded || stallForStore) return;
+                if (entry.op == "SW") {
+                    if (!entry.addrValid) { stallForStore = true; return; }
+                    if (entry.addr == addr) {
+                        if (entry.ready) {
+                            result = entry.value;
+                            forwarded = true;
+                        } else {
+                            stallForStore = true;
+                        }
+                    }
+                }
+            });
+            if (stallForStore) continue; // can't write result this cycle
+            if (!forwarded) {
+                // no prior store matches; read from memory (if present)
+                if (memory.find(addr) != memory.end()) result = memory[addr];
+                else result = (float)addr;
+            }
         }
         // SW: o resultado que será escrito é o valor a ser armazenado; o endereco eh A + base (vk)
         else if (rs[i].op == "SW") {
@@ -276,25 +327,39 @@ void writeResult(int cycle, std::vector<ReservationStation>& rs,
             if (rs[j].qk == myRobTag) { rs[j].vk = result; rs[j].qk = ""; }
         }
 
-        for (auto& entry : rob) {
-            if (entry.busy && entry.id == rs[i].robId) {
-                if (rs[i].op == "SW") {
-                    // For store, compute effective address from base (vk) and offset A
-                    int addr = rs[i].A + (int)rs[i].vk;
-                    entry.addr = addr;
-                    entry.value = rs[i].vj; // value to store
-                    entry.ready = true;
-                } else if (rs[i].op == "LW") {
-                    int addr = rs[i].A + (int)rs[i].vj;
-                    entry.addr = addr;
-                    if (memory.find(addr) != memory.end()) entry.value = memory[addr];
-                    else entry.value = (float)addr;
-                    entry.ready = true;
-                } else {
-                    entry.value = result;
-                    entry.ready = true;
+        ROBEntry* entry = rob.findById(rs[i].robId);
+        if (entry != nullptr) {
+            if (rs[i].op == "SW") {
+                // For store, compute effective address from base (vk) and offset A.
+                int addr = rs[i].A + (int)rs[i].vk;
+                entry->addr = addr;
+                entry->addrValid = true;
+                entry->value = rs[i].vj;
+                entry->ready = true;
+                entry->state = ROBState::WriteResult;
+
+                // Mirror the ready store into the dedicated StoreBuffer.
+                for (auto& s : sb) {
+                    if (!s.busy) {
+                        s.busy = true;
+                        s.robId = entry->id;
+                        s.addr = addr;
+                        s.value = entry->value;
+                        s.ready = true;
+                        break;
+                    }
                 }
-                break;
+            } else if (rs[i].op == "LW") {
+                int addr = rs[i].A + (int)rs[i].vj;
+                entry->addr = addr;
+                entry->addrValid = true;
+                entry->value = result;
+                entry->ready = true;
+                entry->state = ROBState::WriteResult;
+            } else {
+                entry->value = result;
+                entry->ready = true;
+                entry->state = ROBState::WriteResult;
             }
         }
 
@@ -312,7 +377,8 @@ void writeResult(int cycle, std::vector<ReservationStation>& rs,
 // estiverem prontos e a instrução não foi emitida no ciclo atual; decrementa
 // o contador de ciclos de execução para instruções já em execução.
 void executeInstruction(int cycle, std::vector<ReservationStation>& rs,
-                        std::vector<Instruction>& instructions) {
+                        std::vector<Instruction>& instructions,
+                        CircularROB& rob) {
     for (int i = 0; i < (int)rs.size(); i++) {
         if (!rs[i].busy) continue;
 
@@ -329,6 +395,8 @@ void executeInstruction(int cycle, std::vector<ReservationStation>& rs,
             if (rs[i].instrIndex >= 0) {
                 instructions[rs[i].instrIndex].execStartCycle = cycle;
                 instructions[rs[i].instrIndex].execEndCycle = cycle + getLatency(rs[i].op) - 1;
+                ROBEntry* entry = rob.findById(rs[i].robId);
+                if (entry != nullptr) entry->state = ROBState::Executing;
             }
         }
     }
@@ -342,16 +410,13 @@ void issueInstruction(int cycle, std::vector<Instruction>& instructions, int& ne
                       std::vector<ReservationStation>& rs,
                       std::unordered_map<std::string, std::string>& regStatus,
                       std::unordered_map<std::string, float>& registers,
-                      std::vector<ROBEntry>& rob) {
+                      CircularROB& rob) {
     int issued = 0;
     while (issued < 2 && nextIssue < (int)instructions.size()) {
         Instruction& instr = instructions[nextIssue];
         std::string rsType = getRsType(instr.op);
 
-        ROBEntry* freeROB = nullptr;
-        for (auto& entry : rob) {
-            if (!entry.busy) { freeROB = &entry; break; }
-        }
+        ROBEntry* freeROB = rob.allocate();
 
         ReservationStation* freeRS = nullptr;
         for (int i = 0; i < (int)rs.size(); i++) {
@@ -360,11 +425,11 @@ void issueInstruction(int cycle, std::vector<Instruction>& instructions, int& ne
 
         if (!freeROB || !freeRS) break;
 
-        freeROB->busy = true;
         freeROB->op = instr.op;
         freeROB->dest = (instr.op == "SW") ? "" : instr.r1;
         freeROB->ready = false;
         freeROB->instrIndex = nextIssue;
+        freeROB->state = ROBState::Issued;
         std::string robTag = "#" + std::to_string(freeROB->id);
 
         freeRS->busy = true;
@@ -378,7 +443,8 @@ void issueInstruction(int cycle, std::vector<Instruction>& instructions, int& ne
                 int idProvedor = std::stoi(provedor.substr(1));
                 
                 bool achouPronto = false;
-                for (const auto& e : rob) {
+                for (int idx = 0; idx < rob.capacity(); idx++) {
+                    const auto& e = rob.slotAt(idx);
                     if (e.busy && e.id == idProvedor && e.ready) {
                         vField = e.value;
                         qField = "";
@@ -401,6 +467,9 @@ void issueInstruction(int cycle, std::vector<Instruction>& instructions, int& ne
             freeRS->A = instr.imm;
             lerOperando(instr.r1, freeRS->qj, freeRS->vj);
             lerOperando(instr.r2, freeRS->qk, freeRS->vk);
+            // For stores we keep the ROB destination empty; the store will
+            // either be placed into the StoreBuffer when address/value ready
+            // or written to memory at commit.
         } else {
             lerOperando(instr.r2, freeRS->qj, freeRS->vj);
             lerOperando(instr.r3, freeRS->qk, freeRS->vk);
@@ -480,8 +549,11 @@ int main(int argc, char* argv[]) {
     rs.push_back(ReservationStation("Str1", "STORE"));
     rs.push_back(ReservationStation("Str2", "STORE"));
 
-    std::vector<ROBEntry> rob(6);
-    for (int i = 0; i < 6; i++) rob[i].id = i + 1;
+    CircularROB rob(6);
+
+    // Store buffer: pequena estrutura para segurar stores prontos antes do
+    // commit; tamanho configurável conforme necessidade didática.
+    std::vector<StoreBufferEntry> storeBuffer(4);
 
     std::unordered_map<std::string, float> registers;
     registers["F0"] = 0.0f;   registers["F2"] = 2.5f;   registers["F4"] = 7.0f;
@@ -504,12 +576,12 @@ int main(int argc, char* argv[]) {
     int cycle = 1;
     int nextIssue = 0;
 
-    while (hasWork(instructions, nextIssue, rs, rob)) {
-        commitInstruction(cycle, rob, regStatus, registers, instructions, memory);
-        writeResult(cycle, rs, instructions, rob, memory);
-        executeInstruction(cycle, rs, instructions);
+    while (hasWork(instructions, nextIssue, rs, rob, storeBuffer)) {
+        commitInstruction(cycle, rob, regStatus, registers, instructions, memory, storeBuffer);
+        writeResult(cycle, rs, instructions, rob, memory, storeBuffer);
+        executeInstruction(cycle, rs, instructions, rob);
         issueInstruction(cycle, instructions, nextIssue, rs, regStatus, registers, rob);
-        printState(cycle, rs, regStatus, registers, instructions, rob);
+        printState(cycle, rs, regStatus, registers, instructions, rob, storeBuffer);
         cycle++;
     }
 
