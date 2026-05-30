@@ -16,6 +16,7 @@ class ReservationStation {
         int execCyclesRemaining = 0;
         bool executing = false;
         int instrIndex = -1;
+        int robId = -1;
 
         ReservationStation(std::string name, std::string type)
             : name(name), type(type) {}
@@ -29,6 +30,7 @@ class ReservationStation {
             execCyclesRemaining = 0;
             executing = false;
             instrIndex = -1;
+            robId = -1;
         }
 };
 

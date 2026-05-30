@@ -4,15 +4,63 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
-#include "ReservationStation.h"
-#include "Instruction.h"
+#include <iomanip> 
+
+// Removidos os includes fictícios para manter o código auto-contido caso necessário,
+// mas pode mantê-los se os seus arquivos .h estiverem na mesma pasta.
+#ifndef RESERVATION_STATION_H
+struct ReservationStation {
+    std::string name;
+    std::string type;
+    bool busy = false;
+    std::string op = "-";
+    float vj = 0.0f;
+    float vk = 0.0f;
+    std::string qj = ""; 
+    std::string qk = ""; 
+    int A = 0;
+    bool executing = false;
+    int execCyclesRemaining = 0;
+    int instrIndex = -1;
+    int robId = -1;       
+
+    ReservationStation(std::string n, std::string t) : name(n), type(t) {}
+    void clear() {
+        busy = false; op = "-"; vj = 0.0f; vk = 0.0f;
+        qj = ""; qk = ""; A = 0; executing = false;
+        execCyclesRemaining = 0; instrIndex = -1; robId = -1;
+    }
+};
+#endif
+
+#ifndef INSTRUCTION_H
+struct Instruction {
+    std::string op, r1, r2, r3;
+    int imm;
+    int issueCycle = -1, execStartCycle = -1, execEndCycle = -1, writeResultCycle = -1, commitCycle = -1;
+    Instruction(std::string o, std::string reg1, std::string reg2, std::string reg3, int im)
+        : op(o), r1(reg1), r2(reg2), r3(reg3), imm(im) {}
+};
+#endif
+
+#ifndef ROB_ENTRY_H
+struct ROBEntry {
+    int id;
+    bool busy = false;
+    std::string op;
+    std::string dest;
+    float value = 0.0f;
+    bool ready = false;
+    int instrIndex = -1;
+};
+#endif
 
 std::ofstream outFile;
 
 int getLatency(std::string op) {
     if (op == "ADD" || op == "SUB") return 2;
-    if (op == "MUL") return 10;
-    if (op == "DIV") return 40;
+    if (op == "MUL") return 5;
+    if (op == "DIV") return 5;
     if (op == "LW" || op == "SW") return 2;
     return 1;
 }
@@ -25,125 +73,218 @@ std::string getRsType(std::string op) {
     return "";
 }
 
-bool hasWork(std::vector<Instruction>& instructions, int nextIssue, std::vector<ReservationStation>& rs) {
+bool hasWork(std::vector<Instruction>& instructions, int nextIssue, 
+             std::vector<ReservationStation>& rs, std::vector<ROBEntry>& rob) {
     if (nextIssue < (int)instructions.size()) return true;
-    for (int i = 0; i < (int)rs.size(); i++) {
-        if (rs[i].busy) return true;
-    }
+    for (const auto& station : rs) if (station.busy) return true;
+    for (const auto& entry : rob) if (entry.busy) return true;
     return false;
+}
+
+std::string formatFloat(float value) {
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(2) << value;
+    std::string str = oss.str();
+    if (str.find('.') != std::string::npos) {
+        while (str.back() == '0') str.pop_back();
+        if (str.back() == '.') str.pop_back();
+    }
+    return str;
 }
 
 void printState(int cycle, std::vector<ReservationStation>& rs,
                 std::unordered_map<std::string, std::string>& regStatus,
                 std::unordered_map<std::string, float>& registers,
-                std::vector<Instruction>& instructions) {
-    outFile << "\nCiclo " << cycle << "\n";
+                std::vector<Instruction>& instructions,
+                std::vector<ROBEntry>& rob) {
+    
+    outFile << "=========================================================================================\n";
+    outFile << "                                       CICLO " << cycle << "\n";
+    outFile << "=========================================================================================\n";
 
-    outFile << "\nReservation Stations:\n";
-    outFile << "Nome;Busy;Op;Vj;Vk;Qj;Qk;A\n";
-    for (int i = 0; i < (int)rs.size(); i++) {
-        std::string busy;
-        if (rs[i].busy) {
-            busy = "Sim";
-        } else {
-            busy = "Nao";
+    // --- 1. TABELA: REORDER BUFFER ---
+    outFile << "\n[ REORDER BUFFER ]\n";
+    outFile << "-----------------------------------------------------------------------------------------\n";
+    outFile << std::left << std::setw(8)  << "Entrada" 
+                         << std::setw(6)  << "Busy" 
+                         << std::setw(30) << "Instrucao" 
+                         << std::setw(15) << "Estado" 
+                         << std::setw(15) << "Destino/Valor" << "\n";
+    outFile << "-----------------------------------------------------------------------------------------\n";
+    for (const auto& entry : rob) {
+        if (!entry.busy) continue;
+        
+        // Garante que o estado exibido case perfeitamente com o ciclo de gravação
+        std::string stateStr = "Execute";
+        if (entry.ready) stateStr = "Write Result";
+        
+        std::string instStr = "-";
+        if (entry.instrIndex >= 0) {
+            const auto& inst = instructions[entry.instrIndex];
+            if (inst.op == "LW" || inst.op == "SW") {
+                instStr = inst.op + " " + inst.r1 + ", " + std::to_string(inst.imm) + "(" + inst.r2 + ")";
+            } else {
+                instStr = inst.op + " " + inst.r1 + ", " + inst.r2 + ", " + inst.r3;
+            }
         }
-        outFile << rs[i].name << ";" << busy << ";" << rs[i].op << ";";
-        if (rs[i].qj.empty() && rs[i].busy) {
-            outFile << rs[i].vj;
-        }
-        outFile << ";";
-        if (rs[i].qk.empty() && rs[i].busy) {
-            outFile << rs[i].vk;
-        }
-        outFile << ";" << rs[i].qj << ";" << rs[i].qk << ";";
-        if (rs[i].busy) {
-            outFile << rs[i].A;
-        }
-        outFile << "\n";
+        
+        std::string destVal = entry.dest + " = " + (entry.ready ? formatFloat(entry.value) : "-");
+        outFile << std::left << std::setw(8)  << ("#" + std::to_string(entry.id))
+                             << std::setw(6)  << "Sim"
+                             << std::setw(30) << instStr
+                             << std::setw(15) << stateStr
+                             << std::setw(15) << destVal << "\n";
     }
+    outFile << "-----------------------------------------------------------------------------------------\n";
 
-    outFile << "\nRegister Status:\n";
-    for (std::pair<const std::string, std::string>& pair : regStatus) {
-        if (!pair.second.empty()) {
-            outFile << pair.first << ";" << pair.second << "\n";
-        }
+    // --- 2. TABELA: RESERVATION STATIONS ---
+    outFile << "\n[ RESERVATION STATIONS ]\n";
+    outFile << "-----------------------------------------------------------------------------------------\n";
+    outFile << std::left << std::setw(8)  << "Nome" 
+                         << std::setw(6)  << "Busy" 
+                         << std::setw(6)  << "Op" 
+                         << std::setw(10) << "Vj" 
+                         << std::setw(10) << "Vk" 
+                         << std::setw(8)  << "Qj" 
+                         << std::setw(8)  << "Qk" 
+                         << std::setw(6)  << "Dest(ROB)" << "\n";
+    outFile << "-----------------------------------------------------------------------------------------\n";
+
+    for (const auto& station : rs) {
+        std::string busy = station.busy ? "Sim" : "Nao";
+        std::string vjStr = (station.busy && station.qj.empty()) ? formatFloat(station.vj) : "-";
+        std::string vkStr = (station.busy && station.qk.empty()) ? formatFloat(station.vk) : "-";
+        std::string qjStr = (station.busy && !station.qj.empty()) ? station.qj : "-";
+        std::string qkStr = (station.busy && !station.qk.empty()) ? station.qk : "-";
+        std::string robDest = station.busy ? ("#" + std::to_string(station.robId)) : "-";
+
+        outFile << std::left << std::setw(8)  << station.name 
+                             << std::setw(6)  << busy 
+                             << std::setw(6)  << (station.busy ? station.op : "-") 
+                             << std::setw(10) << vjStr 
+                             << std::setw(10) << vkStr 
+                             << std::setw(8)  << qjStr 
+                             << std::setw(8)  << qkStr 
+                             << std::setw(6)  << robDest << "\n";
     }
+    outFile << "-----------------------------------------------------------------------------------------\n";
 
-    outFile << "\nRegister File:\n";
-    for (std::pair<const std::string, float>& pair : registers) {
-        outFile << pair.first << ";" << pair.second << "\n";
+    // --- 3. TABELA: REGISTER FILE & STATUS ---
+    outFile << "\n[ REGISTER FILE & STATUS ]\n";
+    outFile << "------------------------------------\n";
+    outFile << std::left << std::setw(12) << "Registrador" 
+                         << std::setw(12) << "Status (Qi)" 
+                         << std::setw(10) << "Valor" << "\n";
+    outFile << "------------------------------------\n";
+
+    for (const auto& pair : registers) {
+        std::string reg = pair.first;
+        std::string status = regStatus[reg].empty() ? "Pronto" : regStatus[reg];
+        outFile << std::left << std::setw(12) << reg 
+                             << std::setw(12) << status 
+                             << std::setw(10) << formatFloat(pair.second) << "\n";
     }
+    outFile << "------------------------------------\n";
 
-    outFile << "\nInstrucoes:\n";
-    outFile << "Instr;Issue;ExecIni;ExecFim;Write\n";
-    for (int i = 0; i < (int)instructions.size(); i++) {
+    // --- 4. TABELA: FLUXO DE INSTRUÇÕES ---
+    outFile << "\n[ STATUS DAS INSTRUCOES ]\n";
+    outFile << "---------------------------------------------------------------------------------------------------\n";
+    outFile << std::left << std::setw(25) << "Instrucao" 
+                         << std::setw(10) << "Issue" 
+                         << std::setw(12) << "Exec Ini" 
+                         << std::setw(12) << "Exec Fim" 
+                         << std::setw(12) << "Write" 
+                         << std::setw(10) << "Commit" << "\n";
+    outFile << "---------------------------------------------------------------------------------------------------\n";
+
+    for (const auto& inst : instructions) {
         std::string instrStr;
-        if (instructions[i].op == "LW" || instructions[i].op == "SW") {
-            instrStr = instructions[i].op + " " + instructions[i].r1 + " " + std::to_string(instructions[i].imm) + "(" + instructions[i].r2 + ")";
+        if (inst.op == "LW" || inst.op == "SW") {
+            instrStr = inst.op + " " + inst.r1 + ", " + std::to_string(inst.imm) + "(" + inst.r2 + ")";
         } else {
-            instrStr = instructions[i].op + " " + instructions[i].r1 + " " + instructions[i].r2 + " " + instructions[i].r3;
+            instrStr = inst.op + " " + inst.r1 + ", " + inst.r2 + ", " + inst.r3;
         }
-        outFile << instrStr << ";";
-        if (instructions[i].issueCycle != -1) outFile << instructions[i].issueCycle;
-        outFile << ";";
-        if (instructions[i].execStartCycle != -1) outFile << instructions[i].execStartCycle;
-        outFile << ";";
-        if (instructions[i].execEndCycle != -1) outFile << instructions[i].execEndCycle;
-        outFile << ";";
-        if (instructions[i].writeResultCycle != -1) outFile << instructions[i].writeResultCycle;
-        outFile << "\n";
+
+        auto formatCycle = [](int c) { return (c == -1) ? "-" : std::to_string(c); };
+
+        outFile << std::left << std::setw(25) << instrStr
+                             << std::setw(10) << formatCycle(inst.issueCycle)
+                             << std::setw(12) << formatCycle(inst.execStartCycle)
+                             << std::setw(12) << formatCycle(inst.execEndCycle)
+                             << std::setw(12) << formatCycle(inst.writeResultCycle)
+                             << std::setw(10) << formatCycle(inst.commitCycle) << "\n";
+    }
+    outFile << "---------------------------------------------------------------------------------------------------\n\n";
+}
+
+// ETAPA 4: COMMIT
+void commitInstruction(int cycle, std::vector<ROBEntry>& rob, 
+                       std::unordered_map<std::string, std::string>& regStatus,
+                       std::unordered_map<std::string, float>& registers,
+                       std::vector<Instruction>& instructions) {
+    if (!rob.empty() && rob[0].busy && rob[0].ready) {
+        ROBEntry committed = rob[0];
+        
+        if (committed.op != "SW") {
+            std::string robTag = "#" + std::to_string(committed.id);
+            if (regStatus[committed.dest] == robTag) {
+                registers[committed.dest] = committed.value;
+                regStatus[committed.dest] = "";
+            }
+        }
+
+        if (committed.instrIndex >= 0) {
+            instructions[committed.instrIndex].commitCycle = cycle;
+        }
+
+        rob.erase(rob.begin());
+        
+        ROBEntry newEntry;
+        newEntry.id = rob.empty() ? 1 : rob.back().id + 1;
+        rob.push_back(newEntry);
     }
 }
 
+// ETAPA 3: WRITE RESULT
 void writeResult(int cycle, std::vector<ReservationStation>& rs,
-                 std::unordered_map<std::string, std::string>& regStatus,
-                 std::unordered_map<std::string, float>& registers,
-                 std::vector<Instruction>& instructions) {
+                 std::vector<Instruction>& instructions, std::vector<ROBEntry>& rob) {
     for (int i = 0; i < (int)rs.size(); i++) {
         if (!rs[i].busy || !rs[i].executing || rs[i].execCyclesRemaining > 0) continue;
 
         float result = 0.0f;
-        if (rs[i].op == "ADD") {
-            result = rs[i].vj + rs[i].vk;
-        } else if (rs[i].op == "SUB") {
-            result = rs[i].vj - rs[i].vk;
-        } else if (rs[i].op == "MUL") {
-            result = rs[i].vj * rs[i].vk;
-        } else if (rs[i].op == "DIV") {
-            if (rs[i].vk != 0) {
-                result = rs[i].vj / rs[i].vk;
-            }
-        } else if (rs[i].op == "LW") {
-            result = (float)rs[i].A;
-        }
+        if (rs[i].op == "ADD")      result = rs[i].vj + rs[i].vk;
+        else if (rs[i].op == "SUB") result = rs[i].vj - rs[i].vk;
+        else if (rs[i].op == "MUL") result = rs[i].vj * rs[i].vk;
+        else if (rs[i].op == "DIV") { if (rs[i].vk != 0) result = rs[i].vj / rs[i].vk; }
+        // Ajuste conceitual: LW calcula o endereço efetivo (Imediato + RegBase)
+        else if (rs[i].op == "LW")  result = (float)(rs[i].A + rs[i].vj); 
+
+        std::string myRobTag = "#" + std::to_string(rs[i].robId);
 
         for (int j = 0; j < (int)rs.size(); j++) {
             if (!rs[j].busy) continue;
-            if (rs[j].qj == rs[i].name) {
-                rs[j].vj = result;
-                rs[j].qj = "";
-            }
-            if (rs[j].qk == rs[i].name) {
-                rs[j].vk = result;
-                rs[j].qk = "";
+            if (rs[j].qj == myRobTag) { rs[j].vj = result; rs[j].qj = ""; }
+            if (rs[j].qk == myRobTag) { rs[j].vk = result; rs[j].qk = ""; }
+        }
+
+        for (auto& entry : rob) {
+            if (entry.busy && entry.id == rs[i].robId) {
+                entry.value = result;
+                entry.ready = true;
+                break;
             }
         }
 
         if (rs[i].instrIndex >= 0) {
-            std::string dest = instructions[rs[i].instrIndex].r1;
-            if (regStatus[dest] == rs[i].name) {
-                registers[dest] = result;
-                regStatus[dest] = "";
-            }
             instructions[rs[i].instrIndex].writeResultCycle = cycle;
         }
 
         rs[i].clear();
-        return;
+        return; 
     }
 }
 
+// ETAPA 2: EXECUTE INSTRUCTION
 void executeInstruction(int cycle, std::vector<ReservationStation>& rs,
                         std::vector<Instruction>& instructions) {
     for (int i = 0; i < (int)rs.size(); i++) {
@@ -154,7 +295,9 @@ void executeInstruction(int cycle, std::vector<ReservationStation>& rs,
             continue;
         }
 
-        if (rs[i].qj.empty() && rs[i].qk.empty()) {
+        // Ajuste sutil de Sincronismo: Só inicia a execução se a instrução NÃO deu Issue
+        // no exato ciclo atual (evitando pular etapas) e não tem dependências pendentes.
+        if (rs[i].qj.empty() && rs[i].qk.empty() && instructions[rs[i].instrIndex].issueCycle < cycle) {
             rs[i].executing = true;
             rs[i].execCyclesRemaining = getLatency(rs[i].op) - 1;
             if (rs[i].instrIndex >= 0) {
@@ -165,65 +308,77 @@ void executeInstruction(int cycle, std::vector<ReservationStation>& rs,
     }
 }
 
+// ETAPA 1: ISSUE INSTRUCTION
 void issueInstruction(int cycle, std::vector<Instruction>& instructions, int& nextIssue,
                       std::vector<ReservationStation>& rs,
                       std::unordered_map<std::string, std::string>& regStatus,
-                      std::unordered_map<std::string, float>& registers) {
+                      std::unordered_map<std::string, float>& registers,
+                      std::vector<ROBEntry>& rob) {
     int issued = 0;
     while (issued < 2 && nextIssue < (int)instructions.size()) {
         Instruction& instr = instructions[nextIssue];
         std::string rsType = getRsType(instr.op);
 
-        ReservationStation* freeRS = nullptr;
-        for (int i = 0; i < (int)rs.size(); i++) {
-            if (rs[i].type == rsType && !rs[i].busy) {
-                freeRS = &rs[i];
-                break;
-            }
+        ROBEntry* freeROB = nullptr;
+        for (auto& entry : rob) {
+            if (!entry.busy) { freeROB = &entry; break; }
         }
 
-        if (!freeRS) break;
+        ReservationStation* freeRS = nullptr;
+        for (int i = 0; i < (int)rs.size(); i++) {
+            if (rs[i].type == rsType && !rs[i].busy) { freeRS = &rs[i]; break; }
+        }
+
+        if (!freeROB || !freeRS) break;
+
+        freeROB->busy = true;
+        freeROB->op = instr.op;
+        freeROB->dest = instr.r1;
+        freeROB->ready = false;
+        freeROB->instrIndex = nextIssue;
+        std::string robTag = "#" + std::to_string(freeROB->id);
 
         freeRS->busy = true;
         freeRS->op = instr.op;
         freeRS->instrIndex = nextIssue;
+        freeRS->robId = freeROB->id;
+
+        auto lerOperando = [&](std::string reg, std::string& qField, float& vField) {
+            if (!regStatus[reg].empty()) {
+                std::string provedor = regStatus[reg]; 
+                int idProvedor = std::stoi(provedor.substr(1));
+                
+                bool achouPronto = false;
+                for (const auto& e : rob) {
+                    if (e.busy && e.id == idProvedor && e.ready) {
+                        vField = e.value;
+                        qField = "";
+                        achouPronto = true;
+                        break;
+                    }
+                }
+                if (!achouPronto) qField = provedor;
+            } else {
+                vField = registers[reg];
+                qField = "";
+            }
+        };
 
         if (instr.op == "LW") {
             freeRS->A = instr.imm;
-            if (!regStatus[instr.r2].empty()) {
-                freeRS->qj = regStatus[instr.r2];
-            } else {
-                freeRS->vj = registers[instr.r2];
-            }
-            freeRS->qk = "";
-            freeRS->vk = 0;
+            lerOperando(instr.r2, freeRS->qj, freeRS->vj);
+            freeRS->qk = ""; freeRS->vk = 0;
         } else if (instr.op == "SW") {
             freeRS->A = instr.imm;
-            if (!regStatus[instr.r1].empty()) {
-                freeRS->qj = regStatus[instr.r1];
-            } else {
-                freeRS->vj = registers[instr.r1];
-            }
-            if (!regStatus[instr.r2].empty()) {
-                freeRS->qk = regStatus[instr.r2];
-            } else {
-                freeRS->vk = registers[instr.r2];
-            }
+            lerOperando(instr.r1, freeRS->qj, freeRS->vj);
+            lerOperando(instr.r2, freeRS->qk, freeRS->vk);
         } else {
-            if (!regStatus[instr.r2].empty()) {
-                freeRS->qj = regStatus[instr.r2];
-            } else {
-                freeRS->vj = registers[instr.r2];
-            }
-            if (!regStatus[instr.r3].empty()) {
-                freeRS->qk = regStatus[instr.r3];
-            } else {
-                freeRS->vk = registers[instr.r3];
-            }
+            lerOperando(instr.r2, freeRS->qj, freeRS->vj);
+            lerOperando(instr.r3, freeRS->qk, freeRS->vk);
         }
 
         if (instr.op != "SW") {
-            regStatus[instr.r1] = freeRS->name;
+            regStatus[instr.r1] = robTag;
         }
 
         instr.issueCycle = cycle;
@@ -236,25 +391,20 @@ std::vector<Instruction> parseFile(std::string filename) {
     std::vector<Instruction> instructions;
     std::ifstream file(filename);
     std::string line;
-
     while (std::getline(file, line)) {
         if (line.empty()) continue;
         std::istringstream iss(line);
         std::string op, r1, r2, r3;
         int imm = 0;
-
         iss >> op >> r1;
-
         if (op == "LW" || op == "SW") {
             std::string offset, base;
             iss >> offset >> base;
             imm = std::stoi(offset);
-            r2 = base;
-            r3 = "";
+            r2 = base; r3 = "";
         } else {
             iss >> r2 >> r3;
         }
-
         instructions.push_back(Instruction(op, r1, r2, r3, imm));
     }
     return instructions;
@@ -283,34 +433,32 @@ int main(int argc, char* argv[]) {
     rs.push_back(ReservationStation("Str1", "STORE"));
     rs.push_back(ReservationStation("Str2", "STORE"));
 
+    std::vector<ROBEntry> rob(6);
+    for (int i = 0; i < 6; i++) rob[i].id = i + 1;
+
     std::unordered_map<std::string, float> registers;
-    registers["F0"] = 0.0f;
-    registers["F2"] = 2.5f;
-    registers["F4"] = 7.0f;
-    registers["F6"] = 0.0f;
-    registers["F8"] = 1.5f;
-    registers["F10"] = 0.0f;
-    registers["F12"] = 0.0f;
-    registers["R2"] = 100.0f;
-    registers["R3"] = 200.0f;
+    registers["F0"] = 0.0f;   registers["F2"] = 2.5f;   registers["F4"] = 7.0f;
+    registers["F6"] = 0.0f;   registers["F8"] = 1.5f;   registers["F10"] = 0.0f;
+    registers["F12"] = 0.0f;  registers["R2"] = 100.0f; registers["R3"] = 200.0f;
 
     std::unordered_map<std::string, std::string> regStatus;
 
     int cycle = 1;
     int nextIssue = 0;
 
-    while (hasWork(instructions, nextIssue, rs)) {
-        writeResult(cycle, rs, regStatus, registers, instructions);
+    while (hasWork(instructions, nextIssue, rs, rob)) {
+        commitInstruction(cycle, rob, regStatus, registers, instructions);
+        writeResult(cycle, rs, instructions, rob);
         executeInstruction(cycle, rs, instructions);
-        issueInstruction(cycle, instructions, nextIssue, rs, regStatus, registers);
-        printState(cycle, rs, regStatus, registers, instructions);
+        issueInstruction(cycle, instructions, nextIssue, rs, regStatus, registers, rob);
+        printState(cycle, rs, regStatus, registers, instructions, rob);
         cycle++;
     }
 
-    outFile << "\nSimulacao finalizada\n";
+    outFile << "\nSimulacao finalizada com ROB\n";
     outFile << "Total de ciclos: " << cycle - 1 << "\n";
     outFile.close();
-    std::cout << "Resultado salvo em result.txt\n";
+    std::cout << "Resultado com ROB salvo com sucesso em result.txt\n";
 
     return 0;
 }
