@@ -3,7 +3,6 @@
 #include <string>
 
 // ROBState: estado explícito de uma entrada do Reorder Buffer.
-// Isso permite exibir no log a mesma coluna "State" que aparece no PDF.
 enum class ROBState {
     Free,
     Issued,
@@ -15,7 +14,7 @@ enum class ROBState {
 // ROBEntry: entrada do Reorder Buffer (ROB).
 // O ROB implementa commit in-order, enquanto permite execução out-of-order.
 // Campos:
-// - id: identificador único da entrada
+// - id: identificador único da entrada, é com essa tag que a renomeação de registradores funciona
 // - busy: se a entrada está sendo usada
 // - op: operação ("ADD","LW","SW",...)
 // - dest: registrador destino (vazio para stores)
@@ -31,8 +30,8 @@ struct ROBEntry {
     float value = 0.0f;
     bool ready = false;
     int instrIndex = -1;
-    int addr = 0; // effective memory address for loads/stores
-    bool addrValid = false; // true when 'addr' was computed and set
+    int addr = 0; // endereço de memória efetivo para loads/stores
+    bool addrValid = false; // true quando 'addr' foi computado 
     ROBState state = ROBState::Free;
 
     // clear: volta a entrada para o estado livre antes de reutilizar o slot.

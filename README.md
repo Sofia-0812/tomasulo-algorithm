@@ -2,6 +2,20 @@
 
 Simulador do algoritmo de Tomasulo em C++ para a disciplina de Arquitetura de Computadores 3.
 
+A implementação modela um processador com execução superescalar (2 vias), execução fora-de-ordem (Out-of-Order Execution) e efetivação em ordem (In-Order Commit) utilizando um Reorder Buffer (ROB).
+
+**Referências:**
+1. Computer Architecture : A Quantitative Approach by Hennessy, John L., Patterson, David A.
+2. https://github.com/ishank4/Tomasulo-Implementation-in-C 
+3. Slides e material didático da disciplina.
+
+# Grupo
+1. Arthur Henrique Tristão Pinto
+2. Filipi Pereira de Mesquita Faria
+3. Julio Cesar Thurow Buzzi
+4. Luis Henrique Ferreira Costa
+5. Sofia Grossi Vieira Santos
+
 ## Como compilar
 
 ```bash
@@ -46,61 +60,45 @@ Cada linha deve ter:
 Exemplo:
 
 ```text
-# comentario ignorado
 132 132.0
 244 244.0
 116 0.0
 ```
 
-Linhas que começam com `#` são ignoradas.
+## Detalhes de Implementação 
 
-## O que está implementado
+1. **Sincronismo Combinacional (Ordem Inversa do Ciclo):**
+   Para evitar que um dado produzido no ciclo N seja consumido de forma instantânea em uma etapa posterior dentro do mesmo ciclo N, a função `main` invoca as etapas do pipeline de trás para frente:
+   `Commit` -> `Write Result` -> `Execute` -> `Issue` -> `PrintState`.
 
-- Issue superscalar com até 2 instruções por ciclo.
-- Reservation Stations para `ADD/SUB`, `MUL/DIV`, `LOAD` e `STORE`.
-- Register Status para renomeação de registradores.
-- CDB lógico para broadcast dos resultados escritos.
-- ROB circular com capacidade fixa, `head/tail` e tags únicas.
-- Estado explícito do ROB na saída (`Issue`, `Execute`, `Write result`, `Commit`).
-- Commit in-order via ROB.
-- Tabela de status das instruções com ciclos de `Issue`, `Exec Ini`, `Exec Fim`, `Write` e `Commit`.
-- Modelo de memória com endereços inteiros e valores `float`.
-- `LW` com cálculo de endereço efetivo.
-- `SW` com cálculo de endereço efetivo e escrita em memória no commit.
-- Forwarding e desambiguação de memória para `LW` quando há stores anteriores no ROB.
-- Store Buffer separado para representar stores prontas antes do commit.
-- Saída detalhada em `result.txt` para acompanhamento ciclo a ciclo.
+2. **Despacho Superescalar (Issue):**
+   O sistema tenta despachar até 2 instruções simultâneas por ciclo, desde que haja slots físicos disponíveis no ROB e em suas respectivas *Reservation Stations* (evitando *Structural Hazards*). Durante esta etapa, o simulador realiza a **renomeação de registradores** para resolver falsas dependências (WAW e WAR).
 
-## O que foi mapeado do PDF
+3. **Reorder Buffer (ROB) Circular:**
+   Implementado na classe `CircularROB`, garante o *In-Order Commit*. As instruções ganham uma Tag única (`nextId`). Se o buffer de tamanho fixo lotar, o despacho é bloqueado estruturalmente até que o `head` libere espaço.
 
-- Reorder Buffer.
-- Reservation Stations.
-- Register Status / renomeação de registradores.
-- Pipeline de issue, execute, write result e commit.
-- Load/Store com desambiguação de memória.
+4. **Desambiguação de Memória e Store Forwarding:**
+   Na etapa de *Write Result*, instruções `LW` varrem o ROB em busca de instruções `SW` mais antigas.
+   - Se houver um `SW` para o mesmo endereço com dado não pronto, o `LW` sofre *Stall*.
+   - Se o dado já estiver pronto no ROB, ocorre o *Store Forwarding* (leitura direta sem ir à memória física).
 
-## Limitações atuais
-
-- Não há branch prediction nem execução especulativa com rollback.
-- Não há tratamento de exceções/interrupts.
-- O simulador não implementa uma política avançada de predição de desvios.
-- O `result.txt` é focado em depuração e aprendizado, não em formato final de produção.
+5. **Store Buffer:**
+   Implementado separadamente do ROB, reflete a restrição física de que escritas em memória são operações destrutivas e assíncronas. Os pacotes de dados ficam armazenados temporariamente na estrutura e a gravação na RAM só é efetivada na fase final de Commit.
 
 ## Estrutura do projeto
 
-- `main.cpp` - simulador principal e loop de clock.
-- `Instruction.h` - representação da instrução e seus ciclos.
-- `ReservationStation.h` - estrutura da estação de reserva.
-- `ROBEntry.h` - entrada do ROB e estado explícito.
-- `ReorderBuffer.h` - implementação circular do ROB.
-- `StoreBuffer.h` - buffer separado para stores prontas.
-- `instructions.txt` - arquivo de entrada de exemplo.
-- `memory.txt` - arquivo opcional de memória inicial.
-- `result.txt` - saída gerada pela simulação.
+- `main.cpp`: Motor do simulador. Contém o loop de clock e as funções principais do pipeline (`issueInstruction`, `executeInstruction`, `writeResult`, `commitInstruction`).
+- `Instruction.h`: Estrutura de dados das instruções originais e logs de tempo.
+- `ReservationStation.h`: Representação das estações de reserva das unidades funcionais.
+- `ROBEntry.h`: Definição de uma entrada individual do ROB (Estado, Destino, Tag).
+- `ReorderBuffer.h`: Lógica da fila circular (FIFO) de manipulação do ROB.
+- `StoreBuffer.h`: Estrutura isolada para guardar stores até o momento do Commit.
+- `instructions.txt` - Arquivo de entrada com as instruções.
+- `memory.txt` - Arquivo de memória inicial.
+- `result.txt` - Saída gerada pela simulação, para o acompanhamento ciclo a ciclo. 
 
-## Observações de funcionamento
+## Limitações atuais
 
-- Ordem por ciclo: `Write Result` → `Execute` → `Issue` → `Print`.
-- `ADD/SUB` usam latência curta; `MUL/DIV` usam latência maior; `LW/SW` usam latência de memória.
-- `LW` e `SW` respeitam dependências via ROB e registradores renomeados.
-- O simulador foi organizado em arquivos menores para facilitar leitura e estudo.
+- O simulador não implementa uma unidade de previsão de desvios. 
+- Não há tratamento interno de interrupções de hardware ou exceções (como divisão por zero prolongada).
+- O arquivo gerado (`result.txt`) é focado exclusivamente em depuração acadêmica e acompanhamento visual do log didático ciclo a ciclo, imitando as tabelas apresentadas em sala de aula, não em formato final de produção.

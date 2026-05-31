@@ -10,10 +10,9 @@
 // - head aponta a entrada mais velha ainda ativa.
 // - tail aponta o próximo slot livre para alocação.
 // - count informa quantas entradas estão ocupadas.
-// - nextId gera tags únicas para dependência (Qi/Qj/Qk) sem reutilização.
+// - nextId gera tags únicas para dependência sem reutilização.
 //
-// A estrutura preserva a ordem in-order do commit e permite representar o ROB
-// do PDF com slots fixos e colunas de estado visíveis.
+// A estrutura preserva a ordem in-order do commit.
 class CircularROB {
     public:
         explicit CircularROB(int capacity)
@@ -33,7 +32,7 @@ class CircularROB {
         // allocate: reserva o próximo slot livre e devolve um ponteiro para ele.
         // O slot já sai marcado como busy e com uma tag única (id).
         ROBEntry* allocate() {
-            if (full()) return nullptr;
+            if (full()) return nullptr; // Se o ROB está cheio não permite alocar
 
             ROBEntry& slot = slots[tail];
             slot.clear();
@@ -83,9 +82,15 @@ class CircularROB {
             return nullptr;
         }
 
+        // Permite acessar um slot específico diretamente pelo número do índice. 
+        // Usado pela função de log visual (printState).
         ROBEntry& slotAt(int index) { return slots[index]; }
         const ROBEntry& slotAt(int index) const { return slots[index]; }
 
+        // Permite que passe uma função arbitrária (Fn fn) para ser executada em todos os itens 
+        // válidos do ROB. É crucial para a Desambiguação de Memória: o laço for começa a ler 
+        // a partir do head (o mais velho) e vai subindo usando o módulo %. Isso garante que o 
+        // processador procure Stores pendentes na estrita ordem de idade.
         template <typename Fn>
         void forEachActive(Fn fn) {
             for (int i = 0; i < count; i++) {
@@ -102,7 +107,7 @@ class CircularROB {
             }
         }
 
-    private:
+    private: // Variáveis de estado
         std::vector<ROBEntry> slots;
         int head;
         int tail;

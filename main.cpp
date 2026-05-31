@@ -5,7 +5,7 @@
 #include <vector>
 #include <unordered_map>
 #include <iomanip> 
-// Modular headers: types are declared in separate headers to keep main.cpp focused
+
 #include "ReservationStation.h"
 #include "Instruction.h"
 #include "ROBEntry.h"
@@ -30,7 +30,7 @@ std::string robStateToString(ROBState state) {
 }
 
 // getLatency: retorna a latência (em ciclos) associada a cada operação.
-// Use este lugar para ajustar latências do pipeline (ADD/SUB, MUL, DIV, LW/SW etc).
+// Aqui determinamos quantos ciclos de clock cada operação vai gastar na etapa de Execução.
 int getLatency(std::string op) {
     if (op == "ADD" || op == "SUB") return 2;
     if (op == "MUL") return 5;
@@ -40,6 +40,7 @@ int getLatency(std::string op) {
 }
 
 // getRsType: mapeia uma operação ao tipo de Reservation Station necessária.
+// Lê o mnemônico (ex: ADD) e diz para qual Estação de Reserva ele deve ser enviado.
 // Retorna "ADD/SUB", "MUL/DIV", "LOAD" ou "STORE".
 std::string getRsType(std::string op) {
     if (op == "ADD" || op == "SUB") return "ADD/SUB";
@@ -50,7 +51,7 @@ std::string getRsType(std::string op) {
 }
 
 // hasWork: determina se ainda há trabalho a ser feito (instruções a emitir,
-// reservation stations ocupadas ou entradas ativas no ROB).
+// reservation stations ocupadas ou entradas ativas no ROB ou no StoreBuffer).
 bool hasWork(std::vector<Instruction>& instructions, int nextIssue, 
              std::vector<ReservationStation>& rs, const CircularROB& rob,
              std::vector<StoreBufferEntry>& sb) {
@@ -232,26 +233,36 @@ void commitInstruction(int cycle, CircularROB& rob,
                        std::vector<Instruction>& instructions,
                        std::unordered_map<int, float>& memory,
                        std::vector<StoreBufferEntry>& sb) {
+
+    // 1. Pega a instrução mais antiga. Se ela não existir ou ainda estiver calculando, cancela.
     ROBEntry* front = rob.front();
     if (front == nullptr || !front->busy || !front->ready) return;
 
+    // 2. Faz uma cópia de segurança e marca visualmente que entrou em commit.
     ROBEntry committed = *front;
     front->state = ROBState::Commit;
 
     if (committed.op == "SW") {
+        // Se for gravação (Store), procura o valor correspondente no StoreBuffer
+        // e efetua a gravação real e destrutiva em 'memory'.
         bool wrote = false;
         for (auto& s : sb) {
             if (s.busy && s.robId == committed.id && s.ready) {
                 memory[s.addr] = s.value;
-                s.busy = false;
+                s.busy = false; // Libera o slot do StoreBuffer
                 wrote = true;
                 break;
             }
         }
+        // Fallback de segurança caso não esteja no StoreBuffer.
         if (!wrote) {
             memory[committed.addr] = committed.value;
         }
     } else {
+        // Resolve Dependências de Saída (Write-After-Write):
+        // Só atualizamos e liberamos o registrador se ele ainda estiver apontando 
+        // para a Tag desta instrução. Se uma instrução mais nova já o renomeou, 
+        // ignoramos para não sobrescrever a Tag nova e corromper o programa.
         std::string robTag = "#" + std::to_string(committed.id);
         if (!committed.dest.empty() && regStatus[committed.dest] == robTag) {
             registers[committed.dest] = committed.value;
@@ -259,10 +270,12 @@ void commitInstruction(int cycle, CircularROB& rob,
         }
     }
 
+    // 3. Anota o tempo no log.
     if (committed.instrIndex >= 0) {
         instructions[committed.instrIndex].commitCycle = cycle;
     }
 
+    // 4. Libera o slot do ROB para ser usado por novas instruções.
     rob.commitFront();
 }
 
@@ -276,61 +289,79 @@ void writeResult(int cycle, std::vector<ReservationStation>& rs,
                  std::unordered_map<int, float>& memory,
                  std::vector<StoreBufferEntry>& sb) {
     for (int i = 0; i < (int)rs.size(); i++) {
+        // Ignora estações vazias ou que ainda não terminaram o tempo (countdown > 0)
         if (!rs[i].busy || !rs[i].executing || rs[i].execCyclesRemaining > 0) continue;
 
+        // 1. Executa a matemática baseada no operador.
         float result = 0.0f;
         if (rs[i].op == "ADD")      result = rs[i].vj + rs[i].vk;
         else if (rs[i].op == "SUB") result = rs[i].vj - rs[i].vk;
         else if (rs[i].op == "MUL") result = rs[i].vj * rs[i].vk;
         else if (rs[i].op == "DIV") { if (rs[i].vk != 0) result = rs[i].vj / rs[i].vk; }
-        // LW: ler da memoria (endereco efetivo = A + base)
-                else if (rs[i].op == "LW")  {
-            int addr = rs[i].A + (int)rs[i].vj;
-            // Memory disambiguation / forwarding:
-            // If there is any older store to the same address in the ROB,
-            // we must use that store's value (if ready) or stall the load
-            // until the store computes its address/value.
+        else if (rs[i].op == "LW")  {
+            int addr = rs[i].A + (int)rs[i].vj; // (endereco efetivo = A + base)
+            // Lógica de desambiguação de memória (Store Forwarding):
+            // Se houver algum store (escrita) mais antigo para o mesmo endereço no ROB,
+            // devemos usar o valor desse store (se estiver pronto) ou bloquear (stall) o load
+            // até que o store calcule o seu endereço/valor.
+
+            // Variáveis de controle: 
+            // stallForStore = true se encontrarmos um Store conflitante que ainda não está pronto.
+            // forwarded = true se conseguirmos copiar o valor diretamente de um Store finalizado no ROB.
             bool stallForStore = false;
             bool forwarded = false;
-            // find load's index in the ROB vector
+
+            // Varre o ROB do mais antigo (head) para o mais novo, procurando Stores.
             rob.forEachActive([&](const ROBEntry& entry) {
+                // 1. Ignora instruções mais novas que este Load (entry.id >= rs[i].robId).
+                // 2. Para de procurar se já fizemos forwarding (achamos o valor) ou se decidimos dar Stall (conflito pendente).
                 if (entry.id >= rs[i].robId || forwarded || stallForStore) return;
                 if (entry.op == "SW") {
+                    // Se o Store mais antigo ainda não calculou seu endereço, não sabemos se ele vai
+                    // colidir com o nosso Load. Por segurança, bloqueamos (Stall) o Load.
                     if (!entry.addrValid) { stallForStore = true; return; }
+                    // Se o Store já tem endereço e é o mesmo que o Load quer ler:
                     if (entry.addr == addr) {
+                        // Se o dado do Store já foi calculado, copiamos o valor direto do ROB 
+                        // (Store Forwarding), poupando tempo de acesso à memória.
                         if (entry.ready) {
                             result = entry.value;
                             forwarded = true;
                         } else {
+                            // O endereço é o mesmo, mas o Store ainda está calculando o dado.
+                            // O Load é obrigado a dar Stall e esperar.
                             stallForStore = true;
                         }
                     }
                 }
             });
-            if (stallForStore) continue; // can't write result this cycle
+            if (stallForStore) continue; // Congela se houver conflito!
             if (!forwarded) {
-                // no prior store matches; read from memory (if present)
+                // Lê da memória física se não houve encaminhamento do ROB.
                 if (memory.find(addr) != memory.end()) result = memory[addr];
                 else result = (float)addr;
             }
         }
-        // SW: o resultado que será escrito é o valor a ser armazenado; o endereco eh A + base (vk)
         else if (rs[i].op == "SW") {
-            // nothing to compute here; handled below when updating ROB
+            // Stores repassam os valores de endereço e dado calculados diretamente ao atualizar o ROB.
         }
 
+        // 2. Transmissão no CDB (Common Data Bus)
         std::string myRobTag = "#" + std::to_string(rs[i].robId);
 
         for (int j = 0; j < (int)rs.size(); j++) {
             if (!rs[j].busy) continue;
+            // Se alguém estava esperando a Tag desta instrução, entrega o valor e limpa a dependência.
             if (rs[j].qj == myRobTag) { rs[j].vj = result; rs[j].qj = ""; }
             if (rs[j].qk == myRobTag) { rs[j].vk = result; rs[j].qk = ""; }
         }
 
+        // 3. Atualiza o slot correspondente no ROB informando que o cálculo terminou.
         ROBEntry* entry = rob.findById(rs[i].robId);
         if (entry != nullptr) {
             if (rs[i].op == "SW") {
-                // For store, compute effective address from base (vk) and offset A.
+                // Para Store, computa o endereço efetivo e então guarda endereço e valor no ROB 
+                // e repassa ao Store Buffer.
                 int addr = rs[i].A + (int)rs[i].vk;
                 entry->addr = addr;
                 entry->addrValid = true;
@@ -338,7 +369,7 @@ void writeResult(int cycle, std::vector<ReservationStation>& rs,
                 entry->ready = true;
                 entry->state = ROBState::WriteResult;
 
-                // Mirror the ready store into the dedicated StoreBuffer.
+                // Move os dados preparados para a sala de espera do StoreBuffer
                 for (auto& s : sb) {
                     if (!s.busy) {
                         s.busy = true;
@@ -350,6 +381,7 @@ void writeResult(int cycle, std::vector<ReservationStation>& rs,
                     }
                 }
             } else if (rs[i].op == "LW") {
+                // Grava o resultado da leitura da memória no ROB.
                 int addr = rs[i].A + (int)rs[i].vj;
                 entry->addr = addr;
                 entry->addrValid = true;
@@ -357,6 +389,7 @@ void writeResult(int cycle, std::vector<ReservationStation>& rs,
                 entry->ready = true;
                 entry->state = ROBState::WriteResult;
             } else {
+                // Resultados matemáticos diretos.
                 entry->value = result;
                 entry->ready = true;
                 entry->state = ROBState::WriteResult;
@@ -367,8 +400,9 @@ void writeResult(int cycle, std::vector<ReservationStation>& rs,
             instructions[rs[i].instrIndex].writeResultCycle = cycle;
         }
 
+        // 4. Limpa a Estação de Reserva para ela receber nova instrução.
         rs[i].clear();
-        return; 
+        return; // Apenas 1 gravação por ciclo
     }
 }
 
@@ -382,16 +416,21 @@ void executeInstruction(int cycle, std::vector<ReservationStation>& rs,
     for (int i = 0; i < (int)rs.size(); i++) {
         if (!rs[i].busy) continue;
 
+        // Se a instrução já está rodando, apenas desconta 1 ciclo do tempo de processamento.
         if (rs[i].executing) {
             rs[i].execCyclesRemaining--;
             continue;
         }
 
-        // Ajuste sutil de Sincronismo: Só inicia a execução se a instrução NÃO deu Issue
+        // Ajuste de Sincronismo: Só inicia a execução se a instrução NÃO deu Issue
         // no exato ciclo atual (evitando pular etapas) e não tem dependências pendentes.
+        // Se os dois operandos estão prontos (qj e qk estão vazios) e a 
+        // instrução não entrou neste mesmíssimo ciclo (issueCycle < cycle).
         if (rs[i].qj.empty() && rs[i].qk.empty() && instructions[rs[i].instrIndex].issueCycle < cycle) {
             rs[i].executing = true;
+            // Pega o tempo da operação e começa o contador.
             rs[i].execCyclesRemaining = getLatency(rs[i].op) - 1;
+            // Atualiza os registros de tempo para o log final
             if (rs[i].instrIndex >= 0) {
                 instructions[rs[i].instrIndex].execStartCycle = cycle;
                 instructions[rs[i].instrIndex].execEndCycle = cycle + getLatency(rs[i].op) - 1;
@@ -412,69 +451,81 @@ void issueInstruction(int cycle, std::vector<Instruction>& instructions, int& ne
                       std::unordered_map<std::string, float>& registers,
                       CircularROB& rob) {
     int issued = 0;
+    // Superescalaridade: tenta puxar até 2 instruções por ciclo.
     while (issued < 2 && nextIssue < (int)instructions.size()) {
         Instruction& instr = instructions[nextIssue];
         std::string rsType = getRsType(instr.op);
 
+        // Verifica gargalos estruturais (precisa ter ROB e RS livres)
         ROBEntry* freeROB = rob.allocate();
-
         ReservationStation* freeRS = nullptr;
         for (int i = 0; i < (int)rs.size(); i++) {
             if (rs[i].type == rsType && !rs[i].busy) { freeRS = &rs[i]; break; }
         }
 
+        // Se faltar recurso de hardware, encerra o loop (Stall).
         if (!freeROB || !freeRS) break;
 
+        // Associa os dados base da instrução recém despachada no ROB
         freeROB->op = instr.op;
         freeROB->dest = (instr.op == "SW") ? "" : instr.r1;
         freeROB->ready = false;
         freeROB->instrIndex = nextIssue;
         freeROB->state = ROBState::Issued;
+
+        // Gera a nova Tag que será propagada para quem depender deste resultado 
         std::string robTag = "#" + std::to_string(freeROB->id);
 
+        // Configura a "sala de espera" da unidade funcional correspondente
         freeRS->busy = true;
         freeRS->op = instr.op;
         freeRS->instrIndex = nextIssue;
         freeRS->robId = freeROB->id;
 
+        // lerOperando: Função auxiliar lambda de busca de operandos e verificação de RAW (Read-After-Write)
         auto lerOperando = [&](std::string reg, std::string& qField, float& vField) {
             if (!regStatus[reg].empty()) {
+                // Se o status do registrador tiver uma Tag (ex: #2), ele está esperando cálculo
                 std::string provedor = regStatus[reg]; 
                 int idProvedor = std::stoi(provedor.substr(1));
                 
                 bool achouPronto = false;
+                // Olha no ROB para verificar se o cálculo provedor já finalizou a execução
                 for (int idx = 0; idx < rob.capacity(); idx++) {
                     const auto& e = rob.slotAt(idx);
                     if (e.busy && e.id == idProvedor && e.ready) {
-                        vField = e.value;
-                        qField = "";
+                        vField = e.value; // Pega o valor real diretamente
+                        qField = ""; // Limpa a pendência
                         achouPronto = true;
                         break;
                     }
                 }
+                // Se o provedor continua trabalhando, anota a dependência (Tag) no campo Qj/Qk da RS
                 if (!achouPronto) qField = provedor;
             } else {
+                // Se não há tag pendente, o valor no banco de registradores é o atual e oficial.
                 vField = registers[reg];
                 qField = "";
             }
         };
 
+        // Direcionamento e extração de imediatos e registradores baseado no tipo da instrução
         if (instr.op == "LW") {
-            freeRS->A = instr.imm;
-            lerOperando(instr.r2, freeRS->qj, freeRS->vj);
+            freeRS->A = instr.imm; // Guarda offset da memória na variável Address (A)
+            lerOperando(instr.r2, freeRS->qj, freeRS->vj); // Avalia a base
             freeRS->qk = ""; freeRS->vk = 0;
         } else if (instr.op == "SW") {
             freeRS->A = instr.imm;
-            lerOperando(instr.r1, freeRS->qj, freeRS->vj);
-            lerOperando(instr.r2, freeRS->qk, freeRS->vk);
-            // For stores we keep the ROB destination empty; the store will
-            // either be placed into the StoreBuffer when address/value ready
-            // or written to memory at commit.
+            lerOperando(instr.r1, freeRS->qj, freeRS->vj); // Avalia o dado a ser gravado
+            lerOperando(instr.r2, freeRS->qk, freeRS->vk); // Avalia a base
         } else {
-            lerOperando(instr.r2, freeRS->qj, freeRS->vj);
-            lerOperando(instr.r3, freeRS->qk, freeRS->vk);
+            lerOperando(instr.r2, freeRS->qj, freeRS->vj); // Operando Matemático 1
+            lerOperando(instr.r3, freeRS->qk, freeRS->vk); // Operando Matemático 2
         }
 
+        // Renomeação de Registradores:
+        // O registrador destino passa a apontar para a Tag (#ID) do ROB que acabou de ser criado.
+        // Resolve dependências de nome e saída (WAW e WAR).
         if (instr.op != "SW") {
             regStatus[instr.r1] = robTag;
         }
@@ -485,6 +536,7 @@ void issueInstruction(int cycle, std::vector<Instruction>& instructions, int& ne
     }
 }
 
+// parseFile: Lê o arquivo 'instructions.txt' e converte as strings em estruturas Instruction instanciáveis.
 std::vector<Instruction> parseFile(std::string filename) {
     std::vector<Instruction> instructions;
     std::ifstream file(filename);
@@ -508,6 +560,7 @@ std::vector<Instruction> parseFile(std::string filename) {
     return instructions;
 }
 
+// parseMemoryFile: Inicializa o array simulado da memória principal a partir de 'memory.txt'
 std::unordered_map<int, float> parseMemoryFile(const std::string& filename) {
     std::unordered_map<int, float> mem;
     std::ifstream file(filename);
@@ -524,7 +577,10 @@ std::unordered_map<int, float> parseMemoryFile(const std::string& filename) {
     return mem;
 }
 
+// Inicializa componentes do hardware e coordena o avanço síncrono do sinal de Clock global.
 int main(int argc, char* argv[]) {
+
+    // Leitura de arquivos 
     std::string filename = "instructions.txt";
     std::string memoryFilename = "memory.txt";
     if (argc > 1) filename = argv[1];
@@ -538,6 +594,7 @@ int main(int argc, char* argv[]) {
 
     outFile.open("result.txt");
 
+    // Instanciação física das unidades executivas distribuídas em Estações
     std::vector<ReservationStation> rs;
     rs.push_back(ReservationStation("Add1", "ADD/SUB"));
     rs.push_back(ReservationStation("Add2", "ADD/SUB"));
@@ -549,33 +606,41 @@ int main(int argc, char* argv[]) {
     rs.push_back(ReservationStation("Str1", "STORE"));
     rs.push_back(ReservationStation("Str2", "STORE"));
 
+    // Inicialização da janela de restrição paralela (Capacidade 6)
     CircularROB rob(6);
 
     // Store buffer: pequena estrutura para segurar stores prontos antes do
     // commit; tamanho configurável conforme necessidade didática.
     std::vector<StoreBufferEntry> storeBuffer(4);
 
+    // Prepara/inicializa o banco de registradores. 
+    // Injeta valores iniciais para que as operações matemáticas tenham dados reais 
+    // para calcular.
     std::unordered_map<std::string, float> registers;
     registers["F0"] = 0.0f;   registers["F2"] = 2.5f;   registers["F4"] = 7.0f;
     registers["F6"] = 0.0f;   registers["F8"] = 1.5f;   registers["F10"] = 0.0f;
     registers["F12"] = 0.0f;  registers["R2"] = 100.0f; registers["R3"] = 200.0f;
 
+    // Cria a tabela de renomeação de registradores limpa (ninguém está esperando resultados pendentes).
     std::unordered_map<std::string, std::string> regStatus;
 
-    // Simple memory model: map effective integer addresses to float values.
+    // Cria a memoria principal simulada
+    // Preenche endereços específicos (ex: 32 + R2 = 132) para que as instruções LW não leiam lixo.
     std::unordered_map<int, float> memory;
-    // default initial memory values (kept for backward compatibility)
     memory[132] = 132.0f;
     memory[244] = 244.0f;
     memory[116] = 0.0f;
 
-    // If a memory file exists, parse and override/add entries.
+    // Permite que o usuário sobrescreva a memória através do arquivo 'memory.txt'
     auto fileMem = parseMemoryFile(memoryFilename);
     for (const auto& p : fileMem) memory[p.first] = p.second;
 
     int cycle = 1;
     int nextIssue = 0;
 
+    // Roda enquanto o pipeline não estiver 100% vazio.
+    // As funções são chamadas de trás para frente. Isso impede que um dado produzido no passo 1 
+    // seja consumido magicamente no passo 2 durante o mesmo ciclo de clock (o que seria impossível na física do chip).
     while (hasWork(instructions, nextIssue, rs, rob, storeBuffer)) {
         commitInstruction(cycle, rob, regStatus, registers, instructions, memory, storeBuffer);
         writeResult(cycle, rs, instructions, rob, memory, storeBuffer);
