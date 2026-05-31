@@ -617,9 +617,9 @@ int main(int argc, char* argv[]) {
     // Injeta valores iniciais para que as operações matemáticas tenham dados reais 
     // para calcular.
     std::unordered_map<std::string, float> registers;
-    registers["F0"] = 0.0f;   registers["F2"] = 2.5f;   registers["F4"] = 7.0f;
-    registers["F6"] = 0.0f;   registers["F8"] = 1.5f;   registers["F10"] = 0.0f;
-    registers["F12"] = 0.0f;  registers["R2"] = 100.0f; registers["R3"] = 200.0f;
+    registers["F0"] = 0.0f;   registers["F2"] = 2.0f;   registers["F4"] = 4.0f;
+    registers["F6"] = 10.0f;  registers["F8"] = 7.0f;   registers["F10"] = 20.0f;
+    registers["F12"] = 22.0f; registers["R2"] = 100.0f; registers["R3"] = 200.0f;
 
     // Cria a tabela de renomeação de registradores limpa (ninguém está esperando resultados pendentes).
     std::unordered_map<std::string, std::string> regStatus;
@@ -629,7 +629,7 @@ int main(int argc, char* argv[]) {
     std::unordered_map<int, float> memory;
     memory[132] = 132.0f;
     memory[244] = 244.0f;
-    memory[116] = 0.0f;
+    memory[116] = 20.0f;
 
     // Permite que o usuário sobrescreva a memória através do arquivo 'memory.txt'
     auto fileMem = parseMemoryFile(memoryFilename);

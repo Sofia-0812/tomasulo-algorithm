@@ -18,11 +18,27 @@ A implementação modela um processador com execução superescalar (2 vias), ex
 
 ## Como compilar
 
+Clang: 
+
 ```bash
-clang++ -std=c++11 -g main.cpp -o tomasulo
+clang++ -std=c++14 -g main.cpp -o tomasulo
+```
+GCC:
+
+```bash
+g++ -std=c++11 -g main.cpp -o tomasulo
 ```
 
 ## Como rodar
+
+Clang: 
+
+```bash
+ren tomasulo tomasulo.exe 
+.\tomasulo.exe instructions.txt [memory.txt]
+```
+
+GCC:
 
 ```bash
 ./tomasulo instructions.txt [memory.txt]
@@ -41,12 +57,12 @@ Uma instrução por linha.
 Exemplos:
 
 ```text
-ADD F0 F2 F4
-SUB F8 F6 F2
 MUL F0 F2 F4
-DIV F10 F0 F6
-LW F6 32 R2
-SW F6 16 R2
+SUB F2 F6 F8
+ADD F0 F10 F12
+SW F0 16 R2
+LW F4 16 R2
+DIV F8 F4 F2
 ```
 
 ### `memory.txt`
@@ -62,7 +78,7 @@ Exemplo:
 ```text
 132 132.0
 244 244.0
-116 0.0
+116 20.0
 ```
 
 ## Detalhes de Implementação 
