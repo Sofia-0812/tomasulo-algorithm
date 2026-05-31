@@ -9,7 +9,7 @@ A implementação modela um processador com execução superescalar (2 vias), ex
 2. https://github.com/ishank4/Tomasulo-Implementation-in-C 
 3. Slides e material didático da disciplina.
 
-# Grupo
+**Grupo:**
 1. Arthur Henrique Tristão Pinto
 2. Filipi Pereira de Mesquita Faria
 3. Julio Cesar Thurow Buzzi
